@@ -82,7 +82,12 @@ PROMPTS = {
         "🛡 Scam Checker\n\nForward or paste a suspicious SMS, message, link or UPI id.\n"
         "I'll check it and give a risk level."
     ),
-    "word": "📖 Word Meaning\n\nSend an English word (or a Malayalam word) and I'll give the meaning.",
+    "word": (
+        "📖 Word Meaning\n\nSend a word in ANY language. I'll show the English meaning "
+        "and translate it for you.\n\n"
+        "Pick the language for the explanation below (default: Malayalam), "
+        "or type /to hindi"
+    ),
     "img2pdf": (
         f"🖼 Images → PDF\n\nSend images one by one (max {MAX_FILES}).\n"
         "When finished, send /done"
@@ -160,10 +165,10 @@ def resolve_lang(q: str):
     return None
 
 
-def lang_kb():
+def lang_kb(prefix: str = "tl"):
     rows, row = [], []
     for name, code in POPULAR:
-        row.append(InlineKeyboardButton(name, callback_data=f"tl:{code}"))
+        row.append(InlineKeyboardButton(name, callback_data=f"{prefix}:{code}"))
         if len(row) == 3:
             rows.append(row)
             row = []
@@ -173,7 +178,8 @@ def lang_kb():
     return InlineKeyboardMarkup(rows)
 
 
-LANG_KB = lang_kb()
+LANG_KB = lang_kb("tl")
+WORD_KB = lang_kb("wl")
 
 
 def groq_translate(text: str, target: str) -> str:
@@ -234,44 +240,63 @@ def do_translate(text: str, target=None):
 # ----------------------------------------------------------------------------
 
 
-def do_word(word: str) -> str:
-    word = word.strip()
-    if is_malayalam(word):
-        en = translate(word, "en", "ml")
-        return f"📖 {word}\nEnglish: {en}"
+def do_word(text: str, target: str = "ml") -> str:
+    word = text.strip()[:100]
+    if not word:
+        return "Please send a word."
 
-    word = word.split()[0].lower() if word else word
-    try:
-        ml = translate(word, "ml", "en")
-    except Exception:
-        ml = "-"
+    tname = CODE_TO_NAME.get(target, target)
+    en = translate(word, "en").strip()  # auto-detects the language of the word
+    out = [f"📖 {word}"]
+    if en.lower() != word.lower():
+        out.append(f"English: {en}")
 
-    out = [f"📖 {word}", f"Malayalam: {ml}"]
-    try:
-        r = requests.get(
-            f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}", timeout=10
-        )
-        if r.status_code == 200:
-            entry = r.json()[0]
-            if entry.get("phonetic"):
-                out.append(f"Pronunciation: {entry['phonetic']}")
-            count = 0
-            for meaning in entry.get("meanings", []):
-                for d in meaning.get("definitions", [])[:1]:
-                    out.append(f"\n({meaning['partOfSpeech']}) {d['definition']}")
-                    if d.get("example"):
-                        out.append(f"Example: {d['example']}")
-                    count += 1
-                if count >= 3:
-                    break
-            for p in entry.get("phonetics", []):
-                if p.get("audio"):
-                    out.append(f"\n🔊 {p['audio']}")
-                    break
-        else:
-            out.append("\n(English definition not found)")
-    except Exception as e:  # network etc.
-        log.warning("dictionary error: %s", e)
+    if target != "en":
+        try:
+            t = translate(word, target).strip()
+            if t.lower() != word.lower():
+                out.append(f"{tname}: {t}")
+        except Exception as e:
+            log.warning("word translate error: %s", e)
+
+    # English dictionary (single English word only)
+    lines = []
+    key = en.lower()
+    if re.fullmatch(r"[a-z'\-]+", key):
+        try:
+            r = requests.get(
+                f"https://api.dictionaryapi.dev/api/v2/entries/en/{key}", timeout=10
+            )
+            if r.status_code == 200:
+                entry = r.json()[0]
+                if entry.get("phonetic"):
+                    out.append(f"Pronunciation: {entry['phonetic']}")
+                n = 0
+                for meaning in entry.get("meanings", []):
+                    for d in meaning.get("definitions", [])[:1]:
+                        n += 1
+                        lines.append(f"{n}. ({meaning['partOfSpeech']}) {d['definition']}")
+                        if d.get("example"):
+                            lines.append(f"Example: {d['example']}")
+                    if n >= 3:
+                        break
+                for p in entry.get("phonetics", []):
+                    if p.get("audio"):
+                        out.append(f"🔊 {p['audio']}")
+                        break
+        except Exception as e:
+            log.warning("dictionary error: %s", e)
+
+    if lines:
+        out.append("\nMeaning:\n" + "\n".join(lines))
+        if target != "en":
+            try:
+                tr = translate("\n".join(lines), target)
+                out.append(f"\n🌐 {tname}:\n{tr}")
+            except Exception as e:
+                log.warning("meaning translate error: %s", e)
+    elif len(out) == 1 or (len(out) == 2 and en.lower() == word.lower()):
+        out.append("\n(No dictionary entry found. Try a single common word.)")
     return "\n".join(out)
 
 
@@ -283,7 +308,10 @@ BARE_DOMAIN_RE = re.compile(
     r"\b[a-z0-9-]+\.(?:xyz|top|click|online|site|link|info|cc|tk|ml|ga|cf|gq|buzz|live|icu|vip)\b[^\s]*",
     re.I,
 )
-SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "goo.gl", "cutt.ly", "rb.gy", "is.gd", "shorturl.at", "wa.me"}
+SHORTENERS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "cutt.ly", "rb.gy", "is.gd", "shorturl.at", "wa.me",
+    "gplinks.co", "gplinks.in", "ouo.io", "adf.ly", "linkvertise.com", "shrinkme.io", "droplink.co", "shorte.st",
+}
 BAD_TLDS = (".xyz", ".top", ".click", ".online", ".site", ".link", ".tk", ".ml", ".ga", ".cf", ".gq", ".buzz", ".icu", ".vip", ".cc")
 SCAM_WORDS = {
     "otp": "Asks for OTP",
@@ -504,7 +532,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/menu – main menu\n/done – finish Images→PDF / Merge PDFs\n"
-        "/to <language> – translator target (e.g. /to hindi)\n"
+        "/to <language> – translator / word-meaning language (e.g. /to hindi)\n"
         "/lang – switch voice language (Malayalam/English)\n/cancel – cancel current task"
     )
 
@@ -528,11 +556,14 @@ async def cmd_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not code:
         await update.message.reply_text("Language not found.\nExample: /to hindi   or   /to fr")
         return
-    ctx.user_data["mode"] = "tr"
-    ctx.user_data["tl"] = code
-    await update.message.reply_text(
-        f"🌐 Translating into {CODE_TO_NAME.get(code, code)} ✅\nSend any text."
-    )
+    name = CODE_TO_NAME.get(code, code)
+    if ctx.user_data.get("mode") == "word":
+        ctx.user_data["wl"] = code
+        await update.message.reply_text(f"📖 Meaning language: {name} ✅\nSend any word.")
+    else:
+        ctx.user_data["mode"] = "tr"
+        ctx.user_data["tl"] = code
+        await update.message.reply_text(f"🌐 Translating into {name} ✅\nSend any text.")
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -559,10 +590,22 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass  # same button tapped twice
+    elif d.startswith("wl:"):
+        code = d.split(":", 1)[1]
+        ctx.user_data["mode"] = "word"
+        ctx.user_data["wl"] = code
+        try:
+            await q.edit_message_text(
+                f"📖 Meaning language: {CODE_TO_NAME.get(code, code)} ✅\n\n"
+                "Send any word now (any language).\nChange language below, or type /to <language>.",
+                reply_markup=WORD_KB,
+            )
+        except Exception:
+            pass
     elif d.startswith("go:"):
         mode = d.split(":", 1)[1]
         ctx.user_data["mode"] = mode
-        kb = LANG_KB if mode == "tr" else BACK_KB
+        kb = {"tr": LANG_KB, "word": WORD_KB}.get(mode, BACK_KB)
         await q.edit_message_text(PROMPTS[mode], reply_markup=kb)
 
 
@@ -608,7 +651,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text(f"❌ Translate failed: {e}")
     elif mode == "word":
         try:
-            out = await asyncio.to_thread(do_word, text)
+            out = await asyncio.to_thread(do_word, text, ctx.user_data.get("wl", "ml"))
             await reply_long(msg, out)
         except Exception as e:
             await msg.reply_text(f"❌ Failed: {e}")
