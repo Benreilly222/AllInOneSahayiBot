@@ -1,0 +1,7 @@
+python-telegram-bot==21.6
+deep-translator==1.11.4
+requests
+Pillow
+img2pdf
+pypdf
+pytesseract
