@@ -67,7 +67,12 @@ PDF_KB = InlineKeyboardMarkup(
 BACK_KB = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Main menu", callback_data="home")]])
 
 PROMPTS = {
-    "tr": "🌐 Translator\n\nSend any text.\nEnglish → Malayalam, Malayalam → English (auto detect).",
+    "tr": (
+        "🌐 Translator\n\nChoose the language you want to translate INTO, then send any text "
+        "(any language, auto-detected).\n\n"
+        "Other language? Type: /to hindi  (or /to fr, /to japanese ...)\n"
+        "Nothing chosen = Malayalam ↔ English auto."
+    ),
     "voice": (
         "🎤 Voice to Text\n\nSend a voice message or audio file.\n"
         "Default language: Malayalam. Use /lang to switch Malayalam/English."
@@ -128,11 +133,55 @@ async def get_bytes(msg):
 # ----------------------------------------------------------------------------
 
 
-def do_translate(text: str):
+LANGS = GoogleTranslator().get_supported_languages(as_dict=True)  # name -> code
+CODE_TO_NAME = {c: n.title() for n, c in LANGS.items()}
+CODE_LOOKUP = {c.lower(): c for c in LANGS.values()}
+POPULAR = [
+    ("Malayalam", "ml"), ("English", "en"), ("Hindi", "hi"),
+    ("Tamil", "ta"), ("Telugu", "te"), ("Kannada", "kn"),
+    ("Arabic", "ar"), ("French", "fr"), ("German", "de"),
+    ("Spanish", "es"), ("Japanese", "ja"), ("Chinese", "zh-CN"),
+    ("Russian", "ru"), ("Urdu", "ur"), ("Bengali", "bn"),
+]
+
+
+def resolve_lang(q: str):
+    q = q.strip().lower()
+    if not q:
+        return None
+    if q in LANGS:
+        return LANGS[q]
+    if q in CODE_LOOKUP:
+        return CODE_LOOKUP[q]
+    for name, code in LANGS.items():
+        if name.startswith(q):
+            return code
+    return None
+
+
+def lang_kb():
+    rows, row = [], []
+    for name, code in POPULAR:
+        row.append(InlineKeyboardButton(name, callback_data=f"tl:{code}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Main menu", callback_data="home")])
+    return InlineKeyboardMarkup(rows)
+
+
+LANG_KB = lang_kb()
+
+
+def do_translate(text: str, target=None):
+    """Auto-detects the source language. No target chosen = Malayalam <-> English."""
     text = text[:4500]
-    if is_malayalam(text):
-        return "Malayalam → English", GoogleTranslator(source="ml", target="en").translate(text)
-    return "English → Malayalam", GoogleTranslator(source="auto", target="ml").translate(text)
+    if not target:
+        target = "en" if is_malayalam(text) else "ml"
+    out = GoogleTranslator(source="auto", target=target).translate(text)
+    return CODE_TO_NAME.get(target, target), out
 
 
 # ----------------------------------------------------------------------------
@@ -410,6 +459,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "/menu – main menu\n/done – finish Images→PDF / Merge PDFs\n"
+        "/to <language> – translator target (e.g. /to hindi)\n"
         "/lang – switch voice language (Malayalam/English)\n/cancel – cancel current task"
     )
 
@@ -428,6 +478,18 @@ async def cmd_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎤 Voice language set to {name}")
 
 
+async def cmd_to(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    code = resolve_lang(" ".join(ctx.args)) if ctx.args else None
+    if not code:
+        await update.message.reply_text("Language not found.\nExample: /to hindi   or   /to fr")
+        return
+    ctx.user_data["mode"] = "tr"
+    ctx.user_data["tl"] = code
+    await update.message.reply_text(
+        f"🌐 Translating into {CODE_TO_NAME.get(code, code)} ✅\nSend any text."
+    )
+
+
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -440,10 +502,23 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "pdf":
         ctx.user_data["mode"] = None
         await q.edit_message_text("📄 PDF / Image Tools\n\nChoose one:", reply_markup=PDF_KB)
+    elif d.startswith("tl:"):
+        code = d.split(":", 1)[1]
+        ctx.user_data["mode"] = "tr"
+        ctx.user_data["tl"] = code
+        try:
+            await q.edit_message_text(
+                f"🌐 Translating into {CODE_TO_NAME.get(code, code)} ✅\n\n"
+                "Send any text now.\nChange language below, or type /to <language>.",
+                reply_markup=LANG_KB,
+            )
+        except Exception:
+            pass  # same button tapped twice
     elif d.startswith("go:"):
         mode = d.split(":", 1)[1]
         ctx.user_data["mode"] = mode
-        await q.edit_message_text(PROMPTS[mode], reply_markup=BACK_KB)
+        kb = LANG_KB if mode == "tr" else BACK_KB
+        await q.edit_message_text(PROMPTS[mode], reply_markup=kb)
 
 
 async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -482,8 +557,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if mode == "tr":
         try:
-            direction, out = await asyncio.to_thread(do_translate, text)
-            await reply_long(msg, f"🌐 {direction}\n\n{out}")
+            lang_name, out = await asyncio.to_thread(do_translate, text, ctx.user_data.get("tl"))
+            await reply_long(msg, f"🌐 → {lang_name}\n\n{out}")
         except Exception as e:
             await msg.reply_text(f"❌ Translate failed: {e}")
     elif mode == "word":
@@ -626,6 +701,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("lang", cmd_lang))
+    app.add_handler(CommandHandler("to", cmd_to))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
