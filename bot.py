@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import io
 import logging
 import os
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 
@@ -28,7 +30,7 @@ log = logging.getLogger("bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-SAFE_BROWSING_KEY = os.environ.get("SAFE_BROWSING_KEY", "")
+VT_API_KEY = os.environ.get("VT_API_KEY", "")
 
 MAX_MB = 15  # Render free = low RAM, keep files small
 MAX_BYTES = MAX_MB * 1024 * 1024
@@ -237,33 +239,40 @@ def host_of(url: str) -> str:
     return (urlparse(url).hostname or "").lower()
 
 
-def safe_browsing(urls):
-    if not SAFE_BROWSING_KEY or not urls:
-        return set()
-    body = {
-        "client": {"clientId": "tg-helper-bot", "clientVersion": "1.0"},
-        "threatInfo": {
-            "threatTypes": [
-                "MALWARE",
-                "SOCIAL_ENGINEERING",
-                "UNWANTED_SOFTWARE",
-                "POTENTIALLY_HARMFUL_APPLICATION",
-            ],
-            "platformTypes": ["ANY_PLATFORM"],
-            "threatEntryTypes": ["URL"],
-            "threatEntries": [{"url": u if u.lower().startswith("http") else "http://" + u} for u in urls],
-        },
-    }
-    try:
-        r = requests.post(
-            f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={SAFE_BROWSING_KEY}",
-            json=body,
-            timeout=10,
-        )
-        return {m["threat"]["url"] for m in r.json().get("matches", [])}
-    except Exception as e:
-        log.warning("safe browsing error: %s", e)
-        return set()
+def virustotal(urls):
+    """Check links with VirusTotal (free key, no card). Returns {url: number_of_engines_flagging}."""
+    if not VT_API_KEY or not urls:
+        return {}
+    headers = {"x-apikey": VT_API_KEY}
+    flagged = {}
+    for u in urls[:2]:  # free tier = 4 requests/min
+        full = u if u.lower().startswith("http") else "http://" + u
+        try:
+            uid = base64.urlsafe_b64encode(full.encode()).decode().strip("=")
+            r = requests.get(
+                f"https://www.virustotal.com/api/v3/urls/{uid}", headers=headers, timeout=15
+            )
+            if r.status_code == 404:  # not scanned before -> submit and wait
+                sub = requests.post(
+                    "https://www.virustotal.com/api/v3/urls",
+                    headers=headers,
+                    data={"url": full},
+                    timeout=15,
+                )
+                aid = sub.json()["data"]["id"]
+                time.sleep(8)
+                r = requests.get(
+                    f"https://www.virustotal.com/api/v3/analyses/{aid}", headers=headers, timeout=15
+                )
+                stats = r.json()["data"]["attributes"]["stats"]
+            else:
+                stats = r.json()["data"]["attributes"]["last_analysis_stats"]
+            bad = stats.get("malicious", 0) + stats.get("suspicious", 0)
+            if bad:
+                flagged[u] = bad
+        except Exception as e:
+            log.warning("virustotal error: %s", e)
+    return flagged
 
 
 def do_scam(text: str) -> str:
@@ -279,9 +288,9 @@ def do_scam(text: str) -> str:
             score += 1
 
     urls = extract_urls(text)
-    flagged = safe_browsing(urls)
-    if flagged:
-        reasons.append("• 🚨 Google Safe Browsing flagged a link as dangerous")
+    flagged = virustotal(urls)
+    for u, n in flagged.items():
+        reasons.append(f"• 🚨 {n} security engines flagged this link as dangerous: {u}")
         score += 6
 
     for u in urls:
